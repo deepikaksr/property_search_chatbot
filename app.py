@@ -43,7 +43,10 @@ def load_data_to_mysql(df):
     
     insert_query = "INSERT INTO properties (street, city, state, price, bed, bath, house_size) VALUES (%s,%s,%s,%s,%s,%s,%s)"
     for _, row in df.iterrows():
-        cursor.execute(insert_query, (row['street'], row['city'], row['state'], row['price'], row['bed'], row['bath'], row['house_size']))
+        cursor.execute(insert_query, (
+            row['street'], row['city'], row['state'],
+            row['price'], row['bed'], row['bath'], row['house_size']
+        ))
 
     conn.commit()
     cursor.close()
@@ -64,7 +67,7 @@ def get_embedding(text):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-exp-03-07:embedContent?key={api_key}"
     headers = {"Content-Type": "application/json"}
     data = {"content": {"parts": [{"text": text}]}}
-
+    
     response = requests.post(url, headers=headers, json=data)
     if response.status_code == 200:
         embedding = response.json()['embedding']['values']
@@ -134,7 +137,9 @@ st.title("🏡 AI-Powered Property Search")
 with st.sidebar:
     st.info("⚠️ Only run these if your data has changed:")
     if st.button("Load CSV to MySQL"):
-        csv_df = pd.read_csv("real_estate_data.csv").dropna()
+        # Download dataset from Google Drive
+        url = "https://drive.google.com/uc?export=download&id=11rYUs-AoG_UraNw9EVARvKwav4aQroNt"
+        csv_df = pd.read_csv(url).dropna()
         load_data_to_mysql(csv_df)
     if st.button("Store Embeddings"):
         df = load_data()
@@ -160,3 +165,7 @@ if user_query:
     else:
         response = "No matching properties found. Can you adjust your filters or preferences?"
         st.warning(response)
+
+for message in st.session_state.chat_history:
+    with st.chat_message(message["role"]):
+        st.write(message["content"])
