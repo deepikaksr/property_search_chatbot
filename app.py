@@ -7,139 +7,168 @@ import re
 import os
 from dotenv import load_dotenv
 import google.generativeai as genai
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+import chromadb
+from chromadb.utils import embedding_functions
 
-# Load environment variables
+
+HIDE_SLIDER_TICKS_CSS = """
+<style>
+/* Hide the min and max labels on Streamlit sliders */
+span[data-baseweb="slider"] [data-testid="stTickBarMin"], 
+span[data-baseweb="slider"] [data-testid="stTickBarMax"] {
+    display: none !important;
+}
+</style>
+"""
+
+# Load environment variables and configure Gemini API
 load_dotenv()
 gemini_api_key = os.getenv("GEMINI_API_KEY")
-
-# Configure Gemini API if available
 if gemini_api_key:
     genai.configure(api_key=gemini_api_key)
 
 # Initialize session state variables
 if "sqlite_connection" not in st.session_state:
     st.session_state.sqlite_connection = sqlite3.connect(":memory:", check_same_thread=False)
-
 if "property_data" not in st.session_state:
     st.session_state.property_data = None
 
-if "all_text_chunks" not in st.session_state:
-    st.session_state.all_text_chunks = []
-
-if "tfidf_database" not in st.session_state:
-    st.session_state.tfidf_database = {}
+# Initialize ChromaDB with a persistent directory
+if "chroma_client" not in st.session_state:
+    try:
+        if not os.path.exists("./chroma_db"):
+            os.makedirs("./chroma_db")
+        st.session_state.chroma_client = chromadb.PersistentClient(path="./chroma_db")
+        collection_name = "property_embeddings"
+        default_ef = embedding_functions.DefaultEmbeddingFunction()
+        collection_names = st.session_state.chroma_client.list_collections()
+        if collection_name not in collection_names:
+            st.session_state.embedding_collection = st.session_state.chroma_client.create_collection(
+                name=collection_name,
+                embedding_function=default_ef
+            )
+        else:
+            st.session_state.embedding_collection = st.session_state.chroma_client.get_collection(
+                name=collection_name,
+                embedding_function=default_ef
+            )
+    except Exception as e:
+        print(f"Error initializing ChromaDB: {e}")
+        st.session_state.chroma_client = chromadb.Client()
+        default_ef = embedding_functions.DefaultEmbeddingFunction()
+        st.session_state.embedding_collection = st.session_state.chroma_client.create_collection(
+            name="property_embeddings",
+            embedding_function=default_ef
+        )
 
 if "chat_messages" not in st.session_state:
     st.session_state.chat_messages = []
 
-# Convert property dataframe to text chunks for RAG
 def create_property_chunks(df, chunk_size=20):
-    chunks = []
+    chunks, ids, metadatas = [], [], []
     for i in range(0, len(df), chunk_size):
         batch = df.iloc[i:i+chunk_size]
-        # Create a text description for each property in the batch
-        for _, row in batch.iterrows():
+        for idx, row in batch.iterrows():
             property_desc = " ".join([f"{col}: {str(val)}" for col, val in row.items()])
             chunks.append(property_desc)
-    return chunks
+            ids.append(f"property_{idx}")
+            metadata = {
+                "price": str(row.get("price", "")),
+                "bed": str(row.get("bed", "")),
+                "bath": str(row.get("bath", "")),
+                "status": str(row.get("status", "")),
+                "index": str(idx)
+            }
+            metadatas.append(metadata)
+    return chunks, ids, metadatas
 
-# Process CSV with property data
 def process_property_csv(uploaded_file):
     try:
         df = pd.read_csv(uploaded_file)
-        
-        # Clean the dataframe
         df = df.dropna(axis=1, how='all')
-        
-        # Ensure numeric columns are properly typed
         numeric_cols = detect_numeric_columns(df)
         for col in numeric_cols:
             df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        # Save to sqlite
         table_name = "property_listings"
         df.to_sql(table_name, st.session_state.sqlite_connection, index=False, if_exists="replace")
-        
-        # Extract text chunks for RAG
-        text_chunks = create_property_chunks(df)
-        
-        # Store in session state
+        chunks, ids, metadatas = create_property_chunks(df)
         st.session_state.property_data = df
-        st.session_state.all_text_chunks = text_chunks
-        
-        return df, text_chunks
+        build_chroma_db(chunks, ids, metadatas)
+        return df
     except Exception as e:
-        st.error(f"Error processing CSV: {e}")
-        return None, []
+        print(f"Error processing CSV: {e}")
+        return None
 
-# Detect which columns should be numeric
 def detect_numeric_columns(df):
-    # Columns that typically contain numeric values in property data
     potential_numeric_cols = [
         'price', 'bed', 'bath', 'acre_lot', 'house_size', 'zip_code',
         'bedrooms', 'bathrooms', 'size', 'square_feet', 'sq_ft', 'sqft',
         'area', 'lot_size', 'year', 'year_built', 'built_year', 'age',
         'stories', 'floors', 'rooms', 'garage'
     ]
-    
-    # Check column names
     numeric_cols = []
     for col in df.columns:
         col_lower = col.lower()
-        # Check if column name contains any of the potential numeric terms
         if any(term in col_lower for term in potential_numeric_cols):
             numeric_cols.append(col)
-        # Also check if column has mostly numeric values
-        elif df[col].apply(lambda x: isinstance(x, (int, float)) or 
-                         (isinstance(x, str) and re.match(r'^[$£€]?\d+[,.]?\d*[kKmM]?$', x.strip()))).mean() > 0.7:
-            numeric_cols.append(col)
-    
+        else:
+            ratio_numeric = df[col].apply(
+                lambda x: isinstance(x, (int, float)) or (
+                    isinstance(x, str) and re.match(r'^[$£€]?\d+[,.]?\d*[kKmM]?$', x.strip())
+                )
+            ).mean()
+            if ratio_numeric > 0.7:
+                numeric_cols.append(col)
     return numeric_cols
 
-# Build vector database for property data
-def build_vector_db(text_chunks):
-    if not text_chunks:
-        return
-    
-    tfidf_vectorizer = TfidfVectorizer()
-    embeddings = tfidf_vectorizer.fit_transform(text_chunks)
-    st.session_state.tfidf_database = {
-        "chunks": text_chunks,
-        "embeddings": embeddings,
-        "vectorizer": tfidf_vectorizer
-    }
+def build_chroma_db(chunks, ids, metadatas):
+    try:
+        collection_name = "property_embeddings"
+        collection_names = st.session_state.chroma_client.list_collections()
+        if collection_name in collection_names:
+            st.session_state.chroma_client.delete_collection(collection_name)
+        default_ef = embedding_functions.DefaultEmbeddingFunction()
+        st.session_state.embedding_collection = st.session_state.chroma_client.create_collection(
+            name=collection_name,
+            embedding_function=default_ef
+        )
+        batch_size = 20
+        for i in range(0, len(chunks), batch_size):
+            end_idx = min(i + batch_size, len(chunks))
+            st.session_state.embedding_collection.add(
+                documents=chunks[i:end_idx],
+                ids=ids[i:end_idx],
+                metadatas=metadatas[i:end_idx]
+            )
+    except Exception as e:
+        print(f"Error building ChromaDB: {e}")
+        import traceback
+        print(traceback.format_exc())
 
-# Retrieve relevant property information using semantic search
 def retrieve_property_info(query, top_n=5):
-    if not st.session_state.tfidf_database:
+    try:
+        results = st.session_state.embedding_collection.query(
+            query_texts=[query],
+            n_results=top_n
+        )
+        if results and 'documents' in results and len(results['documents']) > 0:
+            documents = results['documents'][0]
+            metadatas = results['metadatas'][0]
+            distances = results['distances'][0]
+            formatted_results = []
+            for doc, meta, dist in zip(documents, metadatas, distances):
+                similarity = 1 - dist
+                formatted_results.append((doc, similarity, meta))
+            return formatted_results
         return []
-    
-    tfidf_vectorizer = st.session_state.tfidf_database["vectorizer"]
-    embeddings = st.session_state.tfidf_database["embeddings"]
-    
-    # Create query vector
-    query_vector = tfidf_vectorizer.transform([query])
-    
-    # Calculate similarities
-    similarities = cosine_similarity(query_vector, embeddings)[0]
-    
-    # Get top results
-    indices = np.argsort(similarities)[::-1][:top_n]
-    results = [(st.session_state.tfidf_database["chunks"][i], similarities[i]) for i in indices]
-    
-    return results
+    except Exception as e:
+        print(f"Error retrieving from ChromaDB: {e}")
+        return []
 
-# Generate SQL query for property database
 def generate_property_sql(user_query):
     if st.session_state.property_data is None:
         return ""
-    
-    # Get column information
     columns = ", ".join(st.session_state.property_data.columns)
-    
-    # Create a more specific prompt for property search
     prompt_text = f"""
 You are an expert SQL query generator for a real estate database.
 Table Name: property_listings
@@ -167,43 +196,27 @@ User question:
         gemini_model = genai.GenerativeModel("gemini-2.0-flash")
         response = gemini_model.generate_content(prompt_text)
         raw_output = response.text.strip()
-        
-        # Clean the JSON output
         cleaned_output = re.sub(r'```json\n(.*?)\n```', r'\1', raw_output, flags=re.DOTALL)
         cleaned_output = re.sub(r'```(.*?)```', r'\1', cleaned_output, flags=re.DOTALL)
-        
-        # Parse JSON
         try:
             parsed_json = json.loads(cleaned_output)
             sql_query = parsed_json.get("sql_query", "")
-            
-            # Log the generated SQL
             print(f"Generated SQL: {sql_query}")
-            
             return sql_query
         except json.JSONDecodeError:
-            # Fallback if JSON parsing fails: try to extract just the SQL
             sql_match = re.search(r'SELECT.*?;', cleaned_output, re.DOTALL | re.IGNORECASE)
             if sql_match:
                 return sql_match.group(0)
             return ""
-            
     except Exception as e:
         print(f"Error generating SQL: {e}")
         return ""
 
-# Generate natural language answer about properties
 def generate_property_answer(user_query, sql_result=None, is_dataframe=False):
     if is_dataframe:
-        # For dataframe results, just return a placeholder message
-        # The actual display will be handled by Streamlit
         return "Here are the property listings matching your search criteria:"
-    
-    # Get additional context from vector DB
-    retrieved_chunks = retrieve_property_info(user_query)
-    context = "\n".join([f"- {chunk}" for chunk, _ in retrieved_chunks])
-    
-    # Create prompt
+    retrieved_results = retrieve_property_info(user_query)
+    context = "\n".join([f"- {chunk}" for chunk, similarity, meta in retrieved_results])
     prompt_text = f"""
 You are a knowledgeable real estate assistant helping users find properties.
 
@@ -219,47 +232,53 @@ Please provide a helpful, concise answer about the properties.
 If showing summary statistics, mention key details like count, price ranges, bedrooms, bathrooms, and lot sizes.
 If no properties were found, suggest alternative search criteria.
 """
-    
     try:
         gemini_model = genai.GenerativeModel("gemini-2.0-flash")
         response = gemini_model.generate_content(prompt_text)
         return response.text.strip()
     except Exception as e:
         print(f"Error generating property answer: {e}")
-        return f"I found some properties matching your criteria, but I'm having trouble summarizing the results. You can view the details in the table below."
+        return "I found some properties matching your criteria, but I'm having trouble summarizing the results."
 
-# Execute SQL query on property database
 def execute_property_query(sql_query):
     try:
-        # Execute the query
         result_df = pd.read_sql_query(sql_query, st.session_state.sqlite_connection)
-        
-        # Check if we got results
         if len(result_df) == 0:
             return None, "No properties found matching those criteria."
-        
         return result_df, None
     except Exception as e:
         print(f"SQL execution error: {e}")
-        # Try to fix common SQL errors
         if "no such column" in str(e).lower():
             error_detail = str(e)
             column_match = re.search(r"no such column: ([^\s]+)", error_detail, re.IGNORECASE)
             if column_match:
                 bad_column = column_match.group(1)
-                # Suggest similar column
                 if st.session_state.property_data is not None:
-                    similar_columns = [col for col in st.session_state.property_data.columns 
-                                     if bad_column.lower() in col.lower()]
+                    similar_columns = [
+                        col for col in st.session_state.property_data.columns
+                        if bad_column.lower() in col.lower()
+                    ]
                     if similar_columns:
                         return None, f"Column '{bad_column}' not found. Did you mean one of these: {', '.join(similar_columns)}?"
-        
         return None, f"Error executing search: {e}"
 
-# Streamlit UI
+def hybrid_property_search(user_query):
+    sql_query = generate_property_sql(user_query)
+    if sql_query:
+        result_df, error_message = execute_property_query(sql_query)
+        if error_message:
+            return None, error_message
+        return result_df, None
+    else:
+        return None, "Unable to generate a search query for your question."
+
+# Set page config
 st.set_page_config(layout="wide", page_title="Property Search Chatbot")
 
-# Sidebar with file uploader
+# Inject custom CSS to hide min/max slider labels but keep bubble
+st.markdown(HIDE_SLIDER_TICKS_CSS, unsafe_allow_html=True)
+
+# Sidebar: CSV upload
 with st.sidebar:
     st.title("Property Data Uploader")
     uploaded_file = st.file_uploader(
@@ -267,30 +286,124 @@ with st.sidebar:
         type=["csv"],
         accept_multiple_files=False
     )
-    
     if uploaded_file:
         with st.spinner("Processing property data..."):
-            df, text_chunks = process_property_csv(uploaded_file)
-            if df is not None:
-                st.success(f"Loaded {len(df)} property listings")
-                
-                # Display dataset info
-                st.subheader("Dataset Information")
-                cols = df.columns.tolist()
-                st.write(f"Columns: {', '.join(cols[:5])}{'...' if len(cols) > 5 else ''}")
-                
-                # Build vector database
-                build_vector_db(text_chunks)
-                
-                # Show sample of the data
-                st.subheader("Sample Listings")
-                st.dataframe(df.head(3), use_container_width=True)
+            df = process_property_csv(uploaded_file)
+        if df is not None:
+            st.subheader("Dataset Information")
+            cols = df.columns.tolist()
+            st.write(f"Columns: {', '.join(cols[:5])}{'...' if len(cols) > 5 else ''}")
+            st.subheader("Sample Listings")
+            st.dataframe(df.head(3), use_container_width=True)
 
-# Main chat interface
 st.title("🏠 Property Search Chatbot")
 st.write("Ask questions about properties or search for listings that match your criteria.")
 
-# Example queries tailored to the dataset
+# Filter-based search
+if st.session_state.property_data is not None:
+    df = st.session_state.property_data
+    st.markdown("## Filter Based Search")
+    
+    # First row of filters (Price, Bathrooms, Bedrooms, House Size)
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        if 'price' in df.columns and not df['price'].dropna().empty:
+            price_min = int(df['price'].min())
+            price_max = int(df['price'].max())
+            selected_price_range = st.slider(
+                "Price Range", 
+                min_value=price_min, 
+                max_value=price_max, 
+                value=(price_min, price_max)
+            )
+        else:
+            selected_price_range = None
+
+    with col2:
+        if 'bath' in df.columns and not df['bath'].dropna().empty:
+            bath_min = int(df['bath'].min())
+            bath_max = int(df['bath'].max())
+            selected_bath_range = st.slider(
+                "Bathrooms", 
+                min_value=bath_min, 
+                max_value=bath_max, 
+                value=(bath_min, bath_max)
+            )
+        else:
+            selected_bath_range = None
+
+    with col3:
+        if 'bed' in df.columns and not df['bed'].dropna().empty:
+            bed_min = int(df['bed'].min())
+            bed_max = int(df['bed'].max())
+            selected_bed_range = st.slider(
+                "Bedrooms", 
+                min_value=bed_min, 
+                max_value=bed_max, 
+                value=(bed_min, bed_max)
+            )
+        else:
+            selected_bed_range = None
+
+    with col4:
+        if 'house_size' in df.columns and not df['house_size'].dropna().empty:
+            size_min = int(df['house_size'].min())
+            size_max = int(df['house_size'].max())
+            selected_size_range = st.slider(
+                "House Size", 
+                min_value=size_min, 
+                max_value=size_max, 
+                value=(size_min, size_max)
+            )
+        else:
+            selected_size_range = None
+
+    # Second line: City filter
+    selected_cities = None
+    if 'city' in df.columns and not df['city'].dropna().empty:
+        cities = sorted(df['city'].dropna().unique().tolist())
+        st.markdown("### Select City")
+        selected_cities = st.multiselect(
+            label="",  # no label text, just the chips
+            options=cities,
+            default=cities
+        )
+
+    # Apply filters
+    filtered_df = df.copy()
+
+    if selected_price_range:
+        filtered_df = filtered_df[
+            (filtered_df['price'] >= selected_price_range[0]) & 
+            (filtered_df['price'] <= selected_price_range[1])
+        ]
+    if selected_bath_range:
+        filtered_df = filtered_df[
+            (filtered_df['bath'] >= selected_bath_range[0]) & 
+            (filtered_df['bath'] <= selected_bath_range[1])
+        ]
+    if selected_bed_range:
+        filtered_df = filtered_df[
+            (filtered_df['bed'] >= selected_bed_range[0]) & 
+            (filtered_df['bed'] <= selected_bed_range[1])
+        ]
+    if selected_size_range:
+        filtered_df = filtered_df[
+            (filtered_df['house_size'] >= selected_size_range[0]) & 
+            (filtered_df['house_size'] <= selected_size_range[1])
+        ]
+    if selected_cities:
+        filtered_df = filtered_df[filtered_df['city'].isin(selected_cities)]
+
+    st.write(f"Found {len(filtered_df)} properties matching the filters.")
+    st.dataframe(filtered_df, use_container_width=True)
+
+st.markdown("---")
+
+st.markdown("## User Query Based Search")
+st.write("You can also ask a natural language question to search for properties.")
+
 with st.expander("Example Queries"):
     st.markdown("""
     - Show me properties with 3+ bedrooms under $80,000
@@ -303,83 +416,55 @@ with st.expander("Example Queries"):
     - List properties with 4 bedrooms and 2 bathrooms
     """)
 
-# Chat input
-user_input = st.chat_input("Search for properties...") 
+user_input = st.chat_input("Search for properties...")
 
-# Process user input
 if user_input:
-    # Add user message to chat
     st.session_state.chat_messages.append({"role": "user", "content": user_input})
-    
-    # Check if data is loaded
     if st.session_state.property_data is None:
         final_answer = "Please upload a property CSV file to begin searching."
         st.session_state.chat_messages.append({"role": "assistant", "content": final_answer})
     else:
-        # Generate SQL query from user input
-        sql_query = generate_property_sql(user_input)
-        
-        if sql_query:
-            # Execute the query
-            result_df, error_message = execute_property_query(sql_query)
-            
-            if error_message:
-                # Handle error
-                final_answer = error_message
-                st.session_state.chat_messages.append({"role": "assistant", "content": final_answer})
-            else:
-                # Generate answer from results
-                if result_df is not None:
-                    final_answer = generate_property_answer(user_input, is_dataframe=True)
-                    
-                    # Add assistant message
-                    st.session_state.chat_messages.append({
-                        "role": "assistant", 
-                        "content": final_answer,
-                        "has_dataframe": True,
-                        "dataframe": result_df
-                    })
-                else:
-                    final_answer = "No properties found matching your criteria. Try broadening your search."
-                    st.session_state.chat_messages.append({"role": "assistant", "content": final_answer})
-        else:
-            # If SQL generation failed, use RAG approach
-            retrieved_results = retrieve_property_info(user_input, top_n=5)
-            final_answer = generate_property_answer(user_input, sql_result=None)
+        result_df, error_message = hybrid_property_search(user_input)
+        if error_message:
+            final_answer = error_message
             st.session_state.chat_messages.append({"role": "assistant", "content": final_answer})
+        else:
+            if result_df is not None and len(result_df) > 0:
+                final_answer = generate_property_answer(user_input, is_dataframe=True)
+                st.session_state.chat_messages.append({
+                    "role": "assistant", 
+                    "content": final_answer,
+                    "has_dataframe": True,
+                    "dataframe": result_df
+                })
+            else:
+                final_answer = "No properties found matching your criteria. Try broadening your search."
+                st.session_state.chat_messages.append({"role": "assistant", "content": final_answer})
 
-# Display chat messages
 for message in st.session_state.chat_messages:
     if message["role"] == "user":
         st.chat_message("user").write(message["content"])
     else:
         msg_container = st.chat_message("assistant")
         msg_container.write(message["content"])
-        
-        # Display property table if available
         if message.get("has_dataframe") and "dataframe" in message:
-            df = message["dataframe"]
-            # Enhance the display of the dataframe
+            df_to_show = message["dataframe"]
             try:
-                # Format price column
-                if 'price' in df.columns and df['price'].dtype in ['int64', 'float64']:
-                    df['price'] = df['price'].apply(lambda x: f"${int(x):,}" if pd.notnull(x) else "")
-                
-                # Display the enhanced dataframe
+                if 'price' in df_to_show.columns and df_to_show['price'].dtype in ['int64', 'float64']:
+                    df_to_show['price'] = df_to_show['price'].apply(lambda x: f"${int(x):,}" if pd.notnull(x) else "")
                 msg_container.dataframe(
-                    df, 
+                    df_to_show, 
                     use_container_width=True,
                     column_config={
-                        # Customize certain column displays
                         col: st.column_config.TextColumn(
                             col, width="medium"
-                        ) for col in df.columns if df[col].dtype == 'object' and len(df[col].astype(str).str.len()) > 0 and df[col].astype(str).str.len().max() > 20
+                        ) for col in df_to_show.columns 
+                        if df_to_show[col].dtype == 'object' 
+                        and len(df_to_show[col].astype(str).str.len()) > 0 
+                        and df_to_show[col].astype(str).str.len().max() > 20
                     }
                 )
-                
-                # Show count of properties
-                msg_container.caption(f"Showing {len(df)} properties")
-                
+                msg_container.caption(f"Showing {len(df_to_show)} properties")
             except Exception as e:
-                msg_container.error(f"Error displaying property table: {e}")
-                msg_container.dataframe(df)  # Fallback to simple display
+                msg_container.write("Error displaying property table.")
+                msg_container.dataframe(df_to_show)
